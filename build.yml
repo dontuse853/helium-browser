@@ -1,0 +1,130 @@
+name: Build rebranded Helium
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # ====== EDIT THIS: the name shown in the Dock, menus, and Finder ======
+  BROWSER_NAME: "Dontuse Helium"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download latest Helium
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dl
+          REPO="imputnet/helium-macos"
+          SUFFIX="_${{ matrix.arch }}-macos.dmg"
+
+          # Newest stable release first
+          URL=$(gh api "repos/$REPO/releases/latest" \
+            --jq "[.assets[] | select(.name | endswith(\"$SUFFIX\"))][0].browser_download_url" 2>/dev/null || true)
+
+          # Fall back to the newest release of any kind (includes pre-releases)
+          if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+            echo "No stable release with that file, checking recent releases..."
+            URL=$(gh api "repos/$REPO/releases?per_page=30" \
+              --jq "[.[] | select(.draft == false) | .assets[] | select(.name | endswith(\"$SUFFIX\"))][0].browser_download_url")
+          fi
+
+          echo "Downloading: $URL"
+          if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+            echo "No matching .dmg found"
+            exit 1
+          fi
+          curl -fL -o dl/helium.dmg "$URL"
+          ls -lh dl
+
+      - name: Extract the app
+        run: |
+          mkdir -p "$PWD/mnt" work
+          hdiutil attach dl/helium.dmg -mountpoint "$PWD/mnt" -nobrowse -readonly -quiet
+          cp -R mnt/*.app work/
+          hdiutil detach "$PWD/mnt" -quiet
+          ls work
+
+      - name: Rebrand (name and optional icon)
+        run: |
+          cd work
+          APP=$(ls -d *.app | head -1)
+          PLIST="$APP/Contents/Info.plist"
+
+          for key in CFBundleName CFBundleDisplayName; do
+            /usr/libexec/PlistBuddy -c "Set :$key $BROWSER_NAME" "$PLIST" 2>/dev/null \
+              || /usr/libexec/PlistBuddy -c "Add :$key string $BROWSER_NAME" "$PLIST"
+          done
+
+          # Best effort: stop Helium's own updater from replacing this build with stock Helium
+          /usr/libexec/PlistBuddy -c "Delete :SUFeedURL" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :SUEnableAutomaticChecks false" "$PLIST" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :SUEnableAutomaticChecks bool false" "$PLIST" 2>/dev/null || true
+
+          # Optional: put a 1024x1024 icon.png at the top of the repo to use as the app icon
+          if [ -f "$GITHUB_WORKSPACE/icon.png" ]; then
+            ICONFILE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" "$PLIST" 2>/dev/null || echo "app")
+            ICONFILE="${ICONFILE%.icns}"
+            ICONSET="$(mktemp -d)/icon.iconset"
+            mkdir -p "$ICONSET"
+            for s in 16 32 128 256 512; do
+              sips -z $s $s "$GITHUB_WORKSPACE/icon.png" --out "$ICONSET/icon_${s}x${s}.png"
+              sips -z $((s*2)) $((s*2)) "$GITHUB_WORKSPACE/icon.png" --out "$ICONSET/icon_${s}x${s}@2x.png"
+            done
+            iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/$ICONFILE.icns"
+          fi
+
+          mv "$APP" "$BROWSER_NAME.app"
+
+      - name: Sign locally (free, ad-hoc)
+        run: |
+          cd work
+          xattr -cr "$BROWSER_NAME.app"
+          codesign --force --deep -v --sign - "$BROWSER_NAME.app"
+
+      - name: Package
+        run: |
+          cd work
+          NAME="${BROWSER_NAME// /-}-${{ matrix.arch }}"
+          ditto -c -k --keepParent "$BROWSER_NAME.app" "$GITHUB_WORKSPACE/$NAME.zip"
+          sync
+          # hdiutil sometimes reports "Resource busy" on GitHub's Macs, so retry a few times.
+          # If it never works, the .zip above is still produced.
+          for i in 1 2 3 4 5; do
+            if hdiutil create -volname "$BROWSER_NAME" -srcfolder "$BROWSER_NAME.app" \
+              -ov -format UDZO "$GITHUB_WORKSPACE/$NAME.dmg"; then
+              break
+            fi
+            echo "hdiutil was busy, retrying ($i of 5)..."
+            sleep 10
+          done
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            *.dmg
+            *.zip
+
+      - name: Keep as downloadable build (manual runs)
+        uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          name: browser-${{ matrix.arch }}
+          path: |
+            *.dmg
+            *.zip
